@@ -1,221 +1,326 @@
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+
+import { XMLParser } from "fast-xml-parser";
+import SVGParser, { CommandMadeAbsolute } from "svg-path-parser";
 
 // @ts-ignore
 import c2q from "cubic2quad";
 
-function parse(data: string) {
-    return Array.from(data.matchAll(/d="([^"]*)"/g)).map(e => e[1]);
+type Equation = LinearEquation | ParabolicEquation
+
+type LinearEquation = {
+    type: "linear"
+    equation: string,
+    domain: string
 }
 
-function tokenize(data: string[]): (string | number)[][] {
-    return Array.from(data).map((d) => {
-        const cmdRe = /[MmLlHhVvCcSsQqTtAaZz]/g;
-        const numRe = /-?\d*\.?\d+(?:[eE][-+]?\d+)?/g;
-
-        const tokens: (string | number)[] = [];
-        let lastIndex = 0;
-
-        d.replace(cmdRe, (match, offset) => {
-            if (offset > lastIndex) {
-                const chunk = d.slice(lastIndex, offset);
-                const nums = chunk.match(numRe);
-                if (nums) tokens.push(...nums.map(Number));
-            }
-            tokens.push(match);
-            lastIndex = offset + match.length;
-            return match;
-        });
-
-        if (lastIndex < d.length) {
-            const chunk = d.slice(lastIndex);
-            const nums = chunk.match(numRe);
-            if (nums) tokens.push(...nums.map(Number));
-        }
-
-        return tokens;
-    });
+type ParabolicEquation = {
+    type: "parabolic",
+    equation: string,
+    domain: string,
+    range: string
 }
 
-function preprocess(tokens: (string | number)[][]) {
-    return tokens.map(token => {
-        const newtoken: (string | number)[] = [];
+function parse(path: string): SVGParser.CommandMadeAbsolute[] | null {
+    if (!existsSync(path)) return null;
 
-        const cur = { x: 0, y: 0 };
+    const data = readFileSync(path).toString();
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+    const parsed = parser.parse(data);
+    const paths = parsed.svg.g.path;
+    const pathdata = paths.map((path: { d: string }) => path.d);
+    const parsedpaths = pathdata.map((data: string) => SVGParser.parseSVG(data));
+    const absolutepaths = parsedpaths.map((cmds: SVGParser.Command[]) => SVGParser.makeAbsolute(cmds));
 
-        while (token.length) {
-            const cmd = token.shift();
-            newtoken.push(cmd as string);
+    return absolutepaths.flat();
+}
 
-            if (cmd == "m") {
-                const dx = token.shift() as number;
-                const dy = token.shift() as number;
-
-                newtoken.push(dx, dy);
-
-                cur.x += dx;
-                cur.y += dy;
-            } else if (cmd == "c") {
-                const dx1 = token.shift() as number;
-                const dy1 = token.shift() as number;
-                const dx2 = token.shift() as number;
-                const dy2 = token.shift() as number;
-                const dx3 = token.shift() as number;
-                const dy3 = token.shift() as number;
-
-                const x1 = cur.x;
-                const y1 = cur.y;
-                const x2 = cur.x + dx1;
-                const y2 = cur.y + dy1;
-                const x3 = cur.x + dx2;
-                const y3 = cur.y + dy2;
-                const x4 = cur.x + dx3;
-                const y4 = cur.y + dy3;
-
-                const quads = c2q(x1, y1, x2, y2, x3, y3, x4, y4, 0.33);
-                const count = (quads.length - 2) / 4;
-
-                const qx = quads.shift();
-                const qy = quads.shift();
-                newtoken.push("m", qx - cur.x, qy - cur.y);
-
-                cur.x = qx;
-                cur.y = qy;
-
-                for (let i = 0; i < count; i++) {
-                    const qx1 = quads.shift();
-                    const qy1 = quads.shift();
-                    const qx2 = quads.shift();
-                    const qy2 = quads.shift();
-
-                    const qdx1 = qx1 - cur.x;
-                    const qdy1 = qy1 - cur.y;
-                    const qdx2 = qx2 - cur.x;
-                    const qdy2 = qy2 - cur.y;
-
-                    cur.x = qx2;
-                    cur.y = qy2;
-
-                    newtoken.push("q", qdx1, qdy1, qdx2, qdy2);
-                }
-                
-                cur.x = x4;
-                cur.y = y4;
-            }
-        }
+function preprocess(cmds: SVGParser.CommandMadeAbsolute[], scale = 10, precision = 0.3): SVGParser.CommandMadeAbsolute[] {
+    const negated = cmds.map(cmd => {
+        const copy = { ...cmd };
+        const code = copy.code;
         
-        return newtoken;
+        if (code == "C" || code == "Q") {
+            copy.y1 = -copy.y1;
+        }
+
+        if (code == "C" || code == "S") {
+            copy.y2 = -copy.y2;
+        }
+
+        if (code == "A") {
+            copy.ry = -copy.ry;
+        }
+
+        copy.y0 = -copy.y0;
+        copy.y = -copy.y;
+
+        return copy;
     });
+    
+    const scaled = negated.flatMap(cmd => {
+        const copy = { ...cmd };
+        const code = copy.code;
+
+        copy.x *= scale;
+        copy.y *= scale;
+        copy.x0 *= scale;
+        copy.y0 *= scale;
+        
+        if (code == "C" || code == "Q") {
+            copy.x1 *= 10;
+            copy.y1 *= 10;
+        }
+
+        if (code == "C" || code == "S") {
+            copy.x2 *= 10;
+            copy.y2 *= 10;
+        }
+
+        return copy;
+    });
+
+    const converted = scaled.flatMap(cmd => {
+        const copy = { ...cmd };
+
+        if (copy.code == "C") {
+            const newcmds: SVGParser.CommandMadeAbsolute[] = [];
+
+            const { x0, y0, x1, y1, x2, y2, x, y } = copy;
+            const quads = c2q(x0, y0, x1, y1, x2, y2, x, y, precision) as number[];
+
+            const current = { x: quads.shift()!, y: quads.shift()! };
+            newcmds.push({
+                code: "M",
+                command: "moveto",
+                relative: false,
+                x: current.x,
+                y: current.y,
+                x0: 0,
+                y0: 0
+            });
+
+            while (quads.length >= 4) {
+                const cmddata: CommandMadeAbsolute = {
+                    code: "Q",
+                    command: "quadratic curveto",
+                    relative: false,
+                    x0: current.x,
+                    y0: current.y,
+                    x1: quads.shift()!,
+                    y1: quads.shift()!,
+                    x: quads.shift()!,
+                    y: quads.shift()!
+                };
+
+                current.x = cmddata.x;
+                current.y = cmddata.y;
+
+                newcmds.push(cmddata);
+            }
+
+            return newcmds;
+        } else return copy;
+    });
+
+
+    return converted;
 }
 
-function process(pathdata: (string | number)[][]) {
-    const eqs = [];
+function exponentify(number: number): string {
+    const stringified = number.toString();
 
-    for (const tokens of pathdata) {
-        const copy = Array.from(tokens);
+    if (stringified.includes("e")) {
+        const split = stringified.split("e");
 
-        let cmd = null;
-        const cur = { x: 0, y: 0 }; // 598x748
+        const base = split[0];
+        const exponent = split[1];
+
+        return `${base}\\cdot10^{${exponent}}`;
+    } else return stringified;
+}
+
+function signs(equation: string): string {
+    return equation
+        .split("+ -").join("-")
+        .split("- -").join("+");
+}
+
+function process(cmds: SVGParser.CommandMadeAbsolute[]) {
+    const equations: Equation[] = [];
     
-        while (copy.length) {
-            cmd = copy.shift();
+    for (let i = 0; i < cmds.length; i++) {
+        const cmd = cmds[i];
 
-            let x1 = 0, x2 = 0, x3 = 0, y1 = 0, y2 = 0, y3 = 0, a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, m = 0;
-            switch(cmd) {
-                case "m":
-                    cur.x += copy.shift() as number;
-                    cur.y -= copy.shift() as number;
-                    break;
+        switch(cmd.code) {
+            case "V":
+            case "H":
+            case "L": {
+                const { x, y, x0, y0 } = cmd;
 
-                case "q": {
-                    x1 = cur.x;
-                    y1 = cur.y;
-                    x2 = cur.x + (copy.shift() as number);
-                    y2 = cur.y - (copy.shift() as number);
-                    x3 = cur.x + (copy.shift() as number);
-                    y3 = cur.y - (copy.shift() as number);
-                    
-                    // cur.x += copy.shift() as number
-                    // cur.y -= copy.shift() as number
-                    cur.x = x3;
-                    cur.y = y3;
+                const m = (y - y0) / (x - x0);
+                const h = y0 - m * x0;
 
-                    const Ax = 2 * (x2 - x1);
-                    const Ay = 2 * (y2 - y1);
-                    const Bx = x1 - 2 * x2 + x3;
-                    const By = y1 - 2 * y2 + y3;
+                const a = Math.pow(m, 2);
+                const b = 2 * m;
+                const d = 2 * m * h;
+                const e = 2 * h;
+                const f = Math.pow(h, 2);
 
-                    const Δ = By * Ax - Bx * Ay;
-
-                    a += 0; b += 0; c += 0;
-                    d += Δ*Δ;
-                    e += 0;
-                    f += -x1*Δ*Δ;
-
-                    a += 0; c += 0;
-                    d += -Ax*By*Δ;
-                    e += Ax*Bx*Δ;
-                    f += (Ax*By*x1 - Ax*Bx*y1)*Δ;
-
-                    a += -Bx*By*By;
-                    d += 2*Bx*By*By*x1;
-                    f += -Bx*By*By*x1*x1;
-
-                    b += 2*Bx*Bx*By;
-                    d += -2*Bx*Bx*By*y1;
-                    e += -2*Bx*Bx*By*x1;
-                    f += 2*Bx*Bx*By*x1*y1;
-
-                    c += -Bx*Bx*Bx;
-                    e += 2*Bx*Bx*Bx*y1;
-                    f += -Bx*Bx*Bx*y1*y1;
-
-                    eqs.push({
-                        equation: `${a}x^2 + ${b}xy + ${c}y^2 + ${d}x + ${e}y + ${f} = 0`,
-                        domain: `${Math.min(x1, x2, x3)} \\leq x \\leq ${Math.max(x1, x2, x3)}`,
-                        range: `${Math.min(y1, y2, y3)} \\leq y \\leq ${Math.max(y1, y2, y3)}`
+                if (!isFinite(a) || !isFinite(b) || !isFinite(d) || !isFinite(e) || !isFinite(f)) {
+                    equations.push({
+                        type: "linear",
+                        equation: signs(`0x^2 + 0xy + 0y^2 + 1x + 0y - ${x0} = 0`),
+                        domain: `${exponentify(Math.min(y0, y))} \\leq y \\leq ${exponentify(Math.max(y0, y))}`
                     });
-                } break;
-
-                case "l":
-                    x1 = cur.x;
-                    y1 = cur.y;
-                    x2 = x1 + (copy.shift() as number);
-                    y2 = y1 - (copy.shift() as number);
-
-                    cur.x = x2;
-                    cur.y = y2;
-
-                    m = (y2 - y1) / (x2 - x1);
-                    b = y1 - m * x1;
-                    eqs.push({
-                        equation: `${Math.pow(m, 2)}x^2 - ${2 * m}xy + y^2 + ${2 * m * b}x - ${2 * b}y + ${Math.pow(b, 2)} = 0`,
-                        domain: `${Math.min(x1, x2)} \\leq x \\leq ${Math.max(x1, x2)}`
+                } else {
+                    equations.push({
+                        type: "linear",
+                        equation: signs(`${exponentify(a)}x^2 - ${exponentify(b)}xy + y^2 + ${exponentify(d)}x - ${exponentify(e)}y + ${exponentify(f)} = 0`),
+                        domain: `${exponentify(Math.min(x0, x))} \\leq x \\leq ${exponentify(Math.max(x0, x))}`
                     });
-                    break;
+                }
+            } break;
 
-                case "z":
-                    continue;
+            case "Q": {
+                const { x, y, x0, y0, x1, y1 } = cmd;
 
-                default:
-                    console.log(`what: ${cmd}`);
-                    continue;
-            }
+                const Ax = 2 * (x1 - x0);
+                const Ay = 2 * (y1 - y0);
+                const Bx = x0 - 2 * x1 + x;
+                const By = y0 - 2 * y1 + y;
+
+                const delta = By * Ax - Bx * Ay;
+
+                let a = 0, b = 0, c = 0, d = 0, e = 0, f = 0;
+
+                d += delta * delta;
+                f += -x0 * delta * delta;
+
+                d += -Ax * By * delta;
+                e += Ax * Bx * delta;
+                f += (Ax * By * x0 - Ax * Bx * y0) * delta;
+
+                a += -Bx * By * By;
+                d += 2 * Bx * By * By * x0;
+                f += -Bx * By * By * x0 * x0;
+
+                b += 2 * Bx * Bx * By;
+                d += -2 * Bx * Bx * By * y0;
+                e += -2 * Bx * Bx * By * x0;
+                f += 2 * Bx * Bx * By * x0 * y0;
+
+                c += -Bx * Bx * Bx;
+                e += 2 * Bx * Bx * Bx * y0;
+                f += -Bx * Bx * Bx * y0 * y0;
+
+                if (a == 0 && b == 0 && c == 0 && d == 0 && e == 0 && f == 0) {
+                    // fallback to line
+
+                    const m = (y - y0) / (x - x0);
+                    const h = y0 - m * x0;
+
+                    const a = Math.pow(m, 2);
+                    const b = 2 * m;
+                    const d = 2 * m * h;
+                    const e = 2 * h;
+                    const f = Math.pow(h, 2);
+
+                    if (!isFinite(a) || !isFinite(b) || !isFinite(d) || !isFinite(e) || !isFinite(f)) {
+                        equations.push({
+                            type: "linear",
+                            equation: signs(`0x^2 + 0xy + 0y^2 + 1x + 0y - ${x0} = 0`),
+                            domain: `${exponentify(Math.min(y0, y))} \\leq y \\leq ${exponentify(Math.max(y0, y))}`
+                        });
+                    } else {
+                        equations.push({
+                            type: "linear",
+                            equation: signs(`${exponentify(a)}x^2 - ${exponentify(b)}xy + y^2 + ${exponentify(d)}x - ${exponentify(e)}y + ${exponentify(f)} = 0`),
+                            domain: `${exponentify(Math.min(x0, x))} \\leq x \\leq ${exponentify(Math.max(x0, x))}`
+                        });
+                    }
+                } else {
+                    equations.push({
+                        type: "parabolic",
+                        equation: signs(`${exponentify(a)}x^2 + ${exponentify(b)}xy + ${exponentify(c)}y^2 + ${exponentify(d)}x + ${exponentify(e)}y + ${exponentify(f)} = 0`),
+                        domain: `${exponentify(Math.min(x0, x1, x))} \\leq x \\leq ${exponentify(Math.max(x0, x1, x))}`,
+                        range: `${exponentify(Math.min(y0, y1, y))} \\leq y \\leq ${exponentify(Math.max(y0, y1, y))}`
+                    });
+                }
+            } break;
+
+            case "Z": {
+                const { x, y } = cmd;
+                const { x0, y0 } = cmds[i - 1];
+                
+                const m = (y - y0) / (x - x0);
+                const h = y0 - m * x0;
+
+                const a = Math.pow(m, 2);
+                const b = 2 * m;
+                const d = 2 * m * h;
+                const e = 2 * h;
+                const f = Math.pow(h, 2);
+
+                if (!isFinite(a) || !isFinite(b) || !isFinite(d) || !isFinite(e) || !isFinite(f)) {
+                    equations.push({
+                        type: "linear",
+                        equation: signs(`0x^2 + 0xy + 0y^2 + 1x + 0y - ${x0} = 0`),
+                        domain: `${exponentify(Math.min(y0, y))} \\leq y \\leq ${exponentify(Math.max(y0, y))}`
+                    });
+                } else {
+                    equations.push({
+                        type: "linear",
+                        equation: signs(`${exponentify(a)}x^2 - ${exponentify(b)}xy + y^2 + ${exponentify(d)}x - ${exponentify(e)}y + ${exponentify(f)} = 0`),
+                        domain: `${exponentify(Math.min(x0, x))} \\leq x \\leq ${exponentify(Math.max(x0, x))}`
+                    });
+                }
+
+                equations.push({
+                    type: "linear",
+                    equation: signs(`${exponentify(a)}x^2 - ${exponentify(b)}xy + y^2 + ${exponentify(d)}x - ${exponentify(e)}y + ${exponentify(f)} = 0`),
+                    domain: `${exponentify(Math.min(x0, x))} \\leq x \\leq ${exponentify(Math.max(x0, x))}`
+                });
+            } break;
+
+            case "M": {
+                // nothing
+            } break;
+
+            default:
+                console.log(`Ignored command ${cmd.command}.`);
+                console.log(cmd);
         }
     }
 
-    return eqs;
+    return equations;
 }
 
-async function main(): Promise<void> {
-    const paths = parse(readFileSync("input.txt").toString());
-    const tokens = tokenize(paths);
-    const processed = preprocess(tokens);
-    console.log(processed);
-    const eqs = process(processed);
+function output(equations: Equation[]) {
+    const data = equations.map(equation => {
+        if (equation.type == "linear") {
+            return `${equation.equation}\\left\\{${equation.domain}\\right\\}`;
+        } else if (equation.type == "parabolic") {
+            return `${equation.equation}\\left\\{${equation.domain}\\right\\}\\left\\{${equation.range}\\right\\}`;
+        }
+    });
 
-    const data = eqs.map(e => `${e.equation}\\left\\{${e.domain}\\right\\}${e.range ? `\\left\\{${e.range}\\right\\}` : ""}`).join("\n");
-    writeFileSync("out.txt", data);
+    writeFileSync("equations.txt", data.join("\n"));
+}
+
+function main(): void {
+    const start = Date.now();
+
+    const parsed = parse("input.svg");
+    const preprocessed = preprocess(parsed ?? [], 10, 0.3);
+    const equations = process(preprocessed);
+    
+    output(equations);
+
+    const end = Date.now();
+
+    console.log(`Generated ${equations.length} equations.`);
+    console.log(`Took ${(end - start) / 1000}s.`);
 }
 
 main();
-
