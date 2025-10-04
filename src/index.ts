@@ -185,6 +185,7 @@ function process(cmds: SVGParser.CommandMadeAbsolute[]) {
             case "Q": {
                 const { x, y, x0, y0, x1, y1 } = cmd;
 
+                // START OF AI GENERATED CODE //
                 const Ax = 2 * (x1 - x0);
                 const Ay = 2 * (y1 - y0);
                 const Bx = x0 - 2 * x1 + x;
@@ -213,6 +214,7 @@ function process(cmds: SVGParser.CommandMadeAbsolute[]) {
                 c += -Bx * Bx * Bx;
                 e += 2 * Bx * Bx * Bx * y0;
                 f += -Bx * Bx * Bx * y0 * y0;
+                // END OF AI GENERATED CODE //
 
                 if (a == 0 && b == 0 && c == 0 && d == 0 && e == 0 && f == 0) {
                     // fallback to line
